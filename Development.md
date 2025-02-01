@@ -1,5 +1,7 @@
 # Developing scip-typescript
 
+Please note that the yarn version used by CI is `v1.22.19` - you should use this version as well to prevent lockfile conflicts.
+
 ## References
 
 - VS Code is a good reference point for the "correct" behavior
@@ -11,14 +13,25 @@
 ## Running tests
 
 ```sh
+# Run snapshot tests
 npm run test
-```
-
-```
+# Update snapshot test outputs
 npm run update-snapshots
 ```
 
-Generate snapshots and update.
+## Debugging
+
+### Print debugging
+
+For print debugging, you can print types using:
+
+```typescript
+checker.typeToString(type)
+```
+
+TODO: Document how to print the AST for a file
+
+TODO: Document how to print an individual AST node
 
 ## Skipping files/test for local development
 
@@ -30,7 +43,7 @@ loop during local development.
 
 ```sh
 cd /path/to/dir
-DIR=/path/to/scip-typescript "$DIR/node_modules/.bin/ts-node" "$DIR/src/main.ts" index # add --yarn-workspaces if applicable
+DIR=/path/to/scip-typescript "$DIR/node_modules/.bin/tsx" "$DIR/src/main.ts" index # add --yarn-workspaces if applicable
 lsif-typed index.scip > dump.lsif # from github.com/sourcegraph/sourcegraph/lib/codeintel/tools/lsif-typed
 lsif-java snapshot-lsif # from github.com/sourcegraph/lsif-java
 ```

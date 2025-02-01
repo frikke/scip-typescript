@@ -15,6 +15,7 @@ import {
 } from './Descriptor'
 import { Input } from './Input'
 import { Packages } from './Packages'
+import { formatByteSizeAsHumanReadable } from './parseHumanByteSizeIntoNumber'
 import { Range } from './Range'
 import * as scip from './scip'
 import { ScipSymbol } from './ScipSymbol'
@@ -31,6 +32,7 @@ export class FileIndexer {
     public readonly input: Input,
     public readonly document: scip.scip.Document,
     public readonly globalSymbolTable: Map<ts.Node, ScipSymbol>,
+    public readonly globalConstructorTable: Map<ts.ClassDeclaration, boolean>,
     public readonly packages: Packages,
     public readonly sourceFile: ts.SourceFile
   ) {
@@ -38,9 +40,26 @@ export class FileIndexer {
   }
   public index(): void {
     // Uncomment below if you want to skip certain files for local development.
-    // if (!this.sourceFile.fileName.includes('ClassWithPrivate')) {
+    // if (!this.sourceFile.fileName.includes('constructor')) {
     //   return
     // }
+
+    const byteSize = Buffer.from(this.sourceFile.getText()).length
+    if (
+      this.options.maxFileByteSizeNumber &&
+      byteSize > this.options.maxFileByteSizeNumber
+    ) {
+      const humanSize = formatByteSizeAsHumanReadable(byteSize)
+      const humanMaxSize = formatByteSizeAsHumanReadable(
+        this.options.maxFileByteSizeNumber
+      )
+      console.log(
+        `info: skipping file '${this.sourceFile.fileName}' because it has byte size ${humanSize} that exceeds the maximum threshold ${humanMaxSize}. ` +
+          'If you intended to index this file, use the flag --max-file-byte-size to configure the maximum file size threshold.'
+      )
+      return
+    }
+
     this.emitSourceFileOccurrence()
     this.visit(this.sourceFile)
   }
@@ -52,6 +71,7 @@ export class FileIndexer {
     this.pushOccurrence(
       new scip.scip.Occurrence({
         range: [0, 0, 0],
+        enclosing_range: Range.fromNode(this.sourceFile).toLsif(),
         symbol: symbol.value,
         symbol_roles: scip.scip.SymbolRole.Definition,
       })
@@ -67,6 +87,7 @@ export class FileIndexer {
   }
   private visit(node: ts.Node): void {
     if (
+      ts.isConstructorDeclaration(node) ||
       ts.isIdentifier(node) ||
       ts.isPrivateIdentifier(node) ||
       ts.isStringLiteralLike(node)
@@ -76,6 +97,7 @@ export class FileIndexer {
         this.visitSymbolOccurrence(node, sym)
       }
     }
+
     ts.forEachChild(node, node => this.visit(node))
   }
 
@@ -84,7 +106,10 @@ export class FileIndexer {
   //
   // This code is directly based off src/services/goToDefinition.ts.
   private getTSSymbolAtLocation(node: ts.Node): ts.Symbol | undefined {
-    const symbol = this.checker.getSymbolAtLocation(node)
+    const rangeNode: ts.Node = ts.isConstructorDeclaration(node)
+      ? (node.getFirstToken() ?? node)
+      : node
+    const symbol = this.checker.getSymbolAtLocation(rangeNode)
 
     // If this is an alias, and the request came at the declaration location
     // get the aliased symbol instead. This allows for goto def on an import e.g.
@@ -105,25 +130,107 @@ export class FileIndexer {
     return symbol
   }
 
+  private hasConstructor(classDeclaration: ts.ClassDeclaration): boolean {
+    const cached = this.globalConstructorTable.get(classDeclaration)
+    if (cached !== undefined) {
+      return cached
+    }
+
+    for (const member of classDeclaration.members) {
+      if (ts.isConstructorDeclaration(member)) {
+        this.globalConstructorTable.set(classDeclaration, true)
+        return true
+      }
+    }
+
+    this.globalConstructorTable.set(classDeclaration, false)
+    return false
+  }
+
+  private getDeclarationsForPropertyAssignment(
+    node: ts.Node
+  ): ts.Declaration[] | undefined {
+    const objectElement = ts_inline.getContainingObjectLiteralElement(node)
+    if (!objectElement) {
+      return
+    }
+    const contextualType = this.checker.getContextualType(objectElement.parent)
+    if (contextualType === undefined) {
+      return
+    }
+    const symbol = ts_inline.getPropertySymbolFromContextualType(
+      objectElement,
+      contextualType
+    )
+    return symbol?.getDeclarations()
+  }
+
   private visitSymbolOccurrence(node: ts.Node, sym: ts.Symbol): void {
-    const range = Range.fromNode(node).toLsif()
+    const isConstructor = ts.isConstructorDeclaration(node)
+    // For constructors, this method is passed the declaration node and not the identifier node.
+    // In either case, this method needs to get the range of the "name" of the declaration, for constructors we
+    // get the firstToken which contains the text "constructor".
+    const range = Range.fromNode(
+      isConstructor ? (node.getFirstToken() ?? node) : node
+    ).toLsif()
     let role = 0
-    const isDefinitionNode = isDefinition(node)
+    let declarations: ts.Node[] =
+      this.getDeclarationsForPropertyAssignment(node) ?? []
+    const isDefinitionNode = declarations.length === 0 && isDefinition(node)
     if (isDefinitionNode) {
       role |= scip.scip.SymbolRole.Definition
     }
-    const declarations = isDefinitionNode
-      ? // Don't emit ambiguous definition at definition-site. You can reproduce
-        // ambiguous results by triggering "Go to definition" in VS Code on `Conflict`
-        // in the example below:
-        // export const Conflict = 42
-        // export interface Conflict {}
-        //                  ^^^^^^^^ "Go to definition" shows two results: const and interface.
-        // See https://github.com/sourcegraph/scip-typescript/pull/206 for more details.
-        [node.parent]
-      : sym?.declarations || []
+    if (declarations.length === 0) {
+      declarations = ts.isConstructorDeclaration(node)
+        ? [node]
+        : isDefinitionNode
+          ? // Don't emit ambiguous definition at definition-site. You can reproduce
+            // ambiguous results by triggering "Go to definition" in VS Code on `Conflict`
+            // in the example below:
+            // export const Conflict = 42
+            // export interface Conflict {}
+            //                  ^^^^^^^^ "Go to definition" shows two results: const and interface.
+            // See https://github.com/sourcegraph/scip-typescript/pull/206 for more details.
+            [node.parent]
+          : sym?.declarations || []
+    }
     for (const declaration of declarations) {
-      const scipSymbol = this.scipSymbol(declaration)
+      let scipSymbol = this.scipSymbol(declaration)
+
+      let enclosingRange: number[] | undefined
+
+      if (!isDefinitionNode || scipSymbol.isEmpty() || scipSymbol.isLocal()) {
+        // Skip enclosing ranges for these cases
+      } else if (
+        ts.isVariableDeclaration(declaration) &&
+        declaration.initializer &&
+        ts.isFunctionLike(declaration.initializer)
+      ) {
+        enclosingRange = Range.fromNode(declaration.initializer).toLsif()
+      } else if (
+        ts.isFunctionDeclaration(declaration) ||
+        ts.isEnumDeclaration(declaration) ||
+        ts.isTypeAliasDeclaration(declaration) ||
+        ts.isClassDeclaration(declaration) ||
+        ts.isMethodDeclaration(declaration) ||
+        ts.isInterfaceDeclaration(declaration) ||
+        ts.isConstructorDeclaration(declaration)
+      ) {
+        enclosingRange = Range.fromNode(declaration).toLsif()
+      }
+
+      if (
+        ((ts.isIdentifier(node) && ts.isNewExpression(node.parent)) ||
+          (ts.isPropertyAccessExpression(node.parent) &&
+            ts.isNewExpression(node.parent.parent))) &&
+        ts.isClassDeclaration(declaration) &&
+        this.hasConstructor(declaration)
+      ) {
+        scipSymbol = ScipSymbol.global(
+          scipSymbol,
+          methodDescriptor('<constructor>')
+        )
+      }
 
       if (scipSymbol.isEmpty()) {
         // Skip empty symbols
@@ -131,6 +238,7 @@ export class FileIndexer {
       }
       this.pushOccurrence(
         new scip.scip.Occurrence({
+          enclosing_range: enclosingRange,
           range,
           symbol: scipSymbol.value,
           symbol_roles: role,
@@ -246,9 +354,8 @@ export class FileIndexer {
   }
 
   private pushOccurrence(occurrence: scip.scip.Occurrence): void {
-    if (this.document.occurrences.length > 0) {
-      const lastOccurrence =
-        this.document.occurrences[this.document.occurrences.length - 1]
+    const lastOccurrence = this.document.occurrences.at(-1)
+    if (lastOccurrence) {
       if (isEqualOccurrence(lastOccurrence, occurrence)) {
         return
       }
@@ -319,8 +426,8 @@ export class FileIndexer {
     }
     if (ts.isSourceFile(node)) {
       const package_ = this.packages.symbol(node.fileName)
-      if (!package_) {
-        return this.cached(node, ScipSymbol.empty())
+      if (package_.isEmpty()) {
+        return this.cached(node, ScipSymbol.anonymousPackage())
       }
       return this.cached(node, package_)
     }
@@ -359,7 +466,9 @@ export class FileIndexer {
       if (props) {
         try {
           const tpe = this.checker.getTypeOfSymbolAtLocation(props, node)
-          const property = tpe.getProperty(node.name.text)
+          const property = tpe.getProperty(
+            ts_inline.getTextOfJsxAttributeName(node.name)
+          )
           for (const decl of property?.declarations || []) {
             return this.scipSymbol(decl)
           }
@@ -474,17 +583,24 @@ export class FileIndexer {
     const kind = scriptElementKind(node, sym)
     const type = (): string =>
       this.checker.typeToString(this.checker.getTypeAtLocation(node))
-    const signature = (): string | undefined => {
+    const asSignatureDeclaration = (
+      node: ts.Node,
+      sym: ts.Symbol
+    ): ts.SignatureDeclaration | undefined => {
       const declaration = sym.declarations?.[0]
       if (!declaration) {
         return undefined
       }
-      const signatureDeclaration: ts.SignatureDeclaration | undefined =
-        ts.isFunctionDeclaration(declaration)
+      return ts.isConstructorDeclaration(node)
+        ? node
+        : ts.isFunctionDeclaration(declaration)
           ? declaration
           : ts.isMethodDeclaration(declaration)
-          ? declaration
-          : undefined
+            ? declaration
+            : undefined
+    }
+    const signature = (): string | undefined => {
+      const signatureDeclaration = asSignatureDeclaration(node, sym)
       if (!signatureDeclaration) {
         return undefined
       }
@@ -494,25 +610,37 @@ export class FileIndexer {
     }
     switch (kind) {
       case ts.ScriptElementKind.localVariableElement:
-      case ts.ScriptElementKind.variableElement:
+      case ts.ScriptElementKind.variableElement: {
         return 'var ' + node.getText() + ': ' + type()
-      case ts.ScriptElementKind.memberVariableElement:
+      }
+      case ts.ScriptElementKind.memberVariableElement: {
         return '(property) ' + node.getText() + ': ' + type()
-      case ts.ScriptElementKind.parameterElement:
+      }
+      case ts.ScriptElementKind.parameterElement: {
         return '(parameter) ' + node.getText() + ': ' + type()
-      case ts.ScriptElementKind.constElement:
+      }
+      case ts.ScriptElementKind.constElement: {
         return 'const ' + node.getText() + ': ' + type()
-      case ts.ScriptElementKind.letElement:
+      }
+      case ts.ScriptElementKind.letElement: {
         return 'let ' + node.getText() + ': ' + type()
-      case ts.ScriptElementKind.alias:
+      }
+      case ts.ScriptElementKind.alias: {
         return 'type ' + node.getText()
+      }
       case ts.ScriptElementKind.classElement:
-      case ts.ScriptElementKind.localClassElement:
+      case ts.ScriptElementKind.localClassElement: {
+        if (ts.isConstructorDeclaration(node)) {
+          return 'constructor' + (signature() || '')
+        }
         return 'class ' + node.getText()
-      case ts.ScriptElementKind.interfaceElement:
+      }
+      case ts.ScriptElementKind.interfaceElement: {
         return 'interface ' + node.getText()
-      case ts.ScriptElementKind.enumElement:
+      }
+      case ts.ScriptElementKind.enumElement: {
         return 'enum ' + node.getText()
+      }
       case ts.ScriptElementKind.enumMemberElement: {
         let suffix = ''
         const declaration = sym.declarations?.[0]
@@ -524,16 +652,21 @@ export class FileIndexer {
         }
         return '(enum member) ' + node.getText() + suffix
       }
-      case ts.ScriptElementKind.functionElement:
+      case ts.ScriptElementKind.functionElement: {
         return 'function ' + node.getText() + (signature() || type())
-      case ts.ScriptElementKind.memberFunctionElement:
+      }
+      case ts.ScriptElementKind.memberFunctionElement: {
         return '(method) ' + node.getText() + (signature() || type())
-      case ts.ScriptElementKind.memberGetAccessorElement:
+      }
+      case ts.ScriptElementKind.memberGetAccessorElement: {
         return 'get ' + node.getText() + ': ' + type()
-      case ts.ScriptElementKind.memberSetAccessorElement:
+      }
+      case ts.ScriptElementKind.memberSetAccessorElement: {
         return 'set ' + node.getText() + type()
-      case ts.ScriptElementKind.constructorImplementationElement:
+      }
+      case ts.ScriptElementKind.constructorImplementationElement: {
         return ''
+      }
     }
     return node.getText() + ': ' + type()
   }
@@ -561,7 +694,9 @@ export class FileIndexer {
         onAncestor(declaration)
       }
       if (ts.isObjectLiteralExpression(declaration)) {
-        const tpe = this.inferredTypeOfObjectLiteral(declaration)
+        const tpe =
+          this.checker.getContextualType(declaration) ??
+          this.checker.getTypeAtLocation(declaration)
         for (const symbolDeclaration of tpe.symbol?.declarations || []) {
           loop(symbolDeclaration)
         }
@@ -582,38 +717,6 @@ export class FileIndexer {
       }
     }
     loop(node)
-  }
-
-  // Returns the "inferred" type of the provided object literal, where
-  // "inferred" is loosely defined as the type that is expected in the position
-  // where the object literal appears.  For example, the object literal in
-  // `const x: SomeInterface = {y: 42}` has the inferred type `SomeInterface`
-  // even if `this.checker.getTypeAtLocation({y: 42})` does not return
-  // `SomeInterface`. The object literal could satisfy many types, but in this
-  // particular location must only satisfy `SomeInterface`.
-  private inferredTypeOfObjectLiteral(
-    node: ts.ObjectLiteralExpression
-  ): ts.Type {
-    if (ts.isVariableDeclaration(node.parent)) {
-      // Example, return `SomeInterface` from `const x: SomeInterface = {y: 42}`.
-      return this.checker.getTypeAtLocation(node.parent.name)
-    }
-
-    if (ts.isCallOrNewExpression(node.parent)) {
-      // Example: return the type of the second parameter of `someMethod` from
-      // the expression `someMethod(someParameter, {y: 42})`.
-      const signature = this.checker.getResolvedSignature(node.parent)
-      for (const [index, argument] of (node.parent.arguments || []).entries()) {
-        if (argument === node) {
-          const parameterSymbol = signature?.getParameters()[index]
-          if (parameterSymbol) {
-            return this.checker.getTypeOfSymbolAtLocation(parameterSymbol, node)
-          }
-        }
-      }
-    }
-
-    return this.checker.getTypeAtLocation(node)
   }
 }
 
@@ -744,5 +847,7 @@ function declarationName(node: ts.Node): ts.Node | undefined {
  * ^^^^^^^^^^^^^^^^^^^^^ node.parent
  */
 function isDefinition(node: ts.Node): boolean {
-  return declarationName(node.parent) === node
+  return (
+    declarationName(node.parent) === node || ts.isConstructorDeclaration(node)
+  )
 }

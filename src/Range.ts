@@ -3,7 +3,10 @@ import * as ts from 'typescript'
 import { Position } from './Position'
 
 export class Range {
-  constructor(public readonly start: Position, public readonly end: Position) {}
+  constructor(
+    public readonly start: Position,
+    public readonly end: Position
+  ) {}
   public compare(other: Range): number {
     const byStart = this.start.compare(other.start)
     if (byStart !== 0) {
@@ -30,6 +33,7 @@ export class Range {
       new Position(endLine, endCharacter)
     )
   }
+
   public static fromNode(node: ts.Node): Range {
     const sourceFile = node.getSourceFile()
     const start = sourceFile.getLineAndCharacterOfPosition(node.getStart())
@@ -39,6 +43,7 @@ export class Range {
       new Position(end.line, end.character)
     )
   }
+
   public isSingleLine(): boolean {
     return this.start.line === this.end.line
   }

@@ -1,6 +1,5 @@
 import * as path from 'path'
 
-import prettyMilliseconds from 'pretty-ms'
 import ProgressBar from 'progress'
 import * as ts from 'typescript'
 
@@ -72,6 +71,7 @@ export class ProjectIndexer {
   private program: ts.Program
   private checker: ts.TypeChecker
   private symbolCache: Map<ts.Node, ScipSymbol> = new Map()
+  private hasConstructor: Map<ts.ClassDeclaration, boolean> = new Map()
   private packages: Packages
   constructor(
     public readonly config: ts.ParsedCommandLine,
@@ -103,9 +103,8 @@ export class ProjectIndexer {
       )
     }
 
-    const jobs: ProgressBar | undefined = !this.options.progressBar
-      ? undefined
-      : new ProgressBar(
+    const jobs: ProgressBar | undefined = this.options.progressBar
+      ? new ProgressBar(
           `  ${this.options.projectDisplayName} [:bar] :current/:total :title`,
           {
             total: filesToIndex.length,
@@ -117,6 +116,7 @@ export class ProjectIndexer {
             stream: process.stderr,
           }
         )
+      : undefined
     let lastWrite = startTimestamp
     for (const [index, sourceFile] of filesToIndex.entries()) {
       const title = path.relative(this.options.cwd, sourceFile.fileName)
@@ -140,6 +140,7 @@ export class ProjectIndexer {
         input,
         document,
         this.symbolCache,
+        this.hasConstructor,
         this.packages,
         sourceFile
       )
@@ -168,6 +169,25 @@ export class ProjectIndexer {
       `+ ${this.options.projectDisplayName} (${prettyMilliseconds(elapsed)})`
     )
   }
+}
+
+export function prettyMilliseconds(milliseconds: number): string {
+  let ms = Math.floor(milliseconds)
+  let result = ''
+  if (ms >= 1000 * 60) {
+    const minutes = Math.floor(ms / (1000 * 60))
+    if (minutes !== 0) {
+      result += `${minutes}m `
+      ms -= minutes * 1000 * 60
+    }
+  }
+  if (result !== '' || ms >= 1000) {
+    const seconds = Math.floor(ms / 1000)
+    result += `${seconds}s `
+    ms -= seconds * 1000
+  }
+  result += `${ms}ms`
+  return result.trim()
 }
 
 function isSameLanguageVersion(

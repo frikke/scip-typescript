@@ -1,11 +1,10 @@
-  export function process() {
-// definition syntax 1.0.0 src/`typings.ts`/
-//documentation ```ts\nmodule "typings.ts"\n```
-//                ^^^^^^^ definition syntax 1.0.0 src/`typings.ts`/process().
-//                documentation ```ts\nfunction process(): Process\n```
-    return window.process
-//         ^^^^^^ reference typescript 4.8.4 lib/`lib.dom.d.ts`/window.
-//                ^^^^^^^ reference @types/node 17.0.14 `globals.d.ts`/process.
-//                ^^^^^^^ reference @types/node 17.0.14 `process.d.ts`/`'process'`/global/process.
-  }
-  
+// < definition syntax 1.0.0 src/`typings.ts`/
+
+export function process() {
+//              ^^^^^^^ definition syntax 1.0.0 src/`typings.ts`/process().
+  return window.process
+//       ^^^^^^ reference typescript 5.6.2 lib/`lib.dom.d.ts`/window.
+//              ^^^^^^^ reference @types/node 20.16.10 `globals.d.ts`/global/process.
+//              ^^^^^^^ reference @types/node 20.16.10 `process.d.ts`/`"process"`/global/process.
+}
+
